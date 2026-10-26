@@ -12,7 +12,8 @@
         "clib-utils-qtr",
         "directxtk",
         "skse-mcp",
-        "nlohmann-json"
+        "nlohmann-json",
+        "detours"
     ],
     "overrides": [
         {

@@ -80,7 +80,7 @@ public:
         }
 
         if (auto* fadeNode = node->AsFadeNode()) {
-            fadeNode->fadeAmount = visibility;
+            fadeNode->GetFadeAmount() = visibility;
         }
     }
 

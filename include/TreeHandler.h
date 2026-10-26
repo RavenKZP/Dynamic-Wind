@@ -133,6 +133,7 @@ private:
         auto form = RE::TESForm::LookupByID(formID);
         if (!form) {
             logger::error("Can't find form for FormID {} '{}'", j["FormID"].get<std::string>(), outConfig.formID);
+            return false;
         }
 
         if (auto tree = form->As<RE::TESObjectTREE>()) {

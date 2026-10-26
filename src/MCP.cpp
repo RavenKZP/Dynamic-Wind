@@ -102,6 +102,10 @@ namespace MCP {
                 ImGuiMCP::SameLine();
                 ImGuiMCP::Text(" (%s)", GetCompassLabel(newAngle));
                 ImGuiMCP::SliderFloat("New Target Speed", &newSpeed, 0.0f, 1.0f);
+                if (ImGuiMCP::Button("Generate New Targets")) {
+                    windManager->EnableMod();
+                }
+                ImGuiMCP::SameLine();
                 if (ImGuiMCP::Button("Applay New Targets")) {
                     windManager->SetTargets(newAngle, newSpeed);
                 }
