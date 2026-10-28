@@ -9,9 +9,11 @@
 #include "RotationHandler.h"
 #include "TreeHandler.h"
 #include "VisibilityHandler.h"
+#include "WindProvider.h"
 
 #include "REX/REX.h"
 
+#include <cmath>
 #include <unordered_set>
 #include <shared_mutex>
 
@@ -30,6 +32,47 @@ public:
     void Update(float strength, float angle, float deltaTime) {
         auto* conf = Config::GetSingleton();
         std::unique_lock lock(mutex_);
+        WindProvider::BeginUpdate(deltaTime);
+        const SKSE::stl::scope_exit endUpdate([] {
+            WindProvider::EndUpdate();
+        });
+        _providerRequests.clear();
+        _providerIndices.clear();
+        const bool providerEnabled = WindProvider::IsEnabled();
+        size_t targetStart = 0;
+        if (providerEnabled) {
+            const auto collect = [&](const auto& refs, DynamicWindAPI::Handler handler, DynamicWindAPI::Event event) {
+                for (const auto& [formID, handle] : refs) {
+                    const auto ref = handle.get();
+                    if (!ref || ref->IsDisabled() || ref->IsDeleted()) continue;
+                    const auto position = ref->GetPosition();
+                    _providerIndices.emplace((uint64_t(handler) << 40) | (uint64_t(event) << 32) | formID, _providerRequests.size());
+                    _providerRequests.push_back({formID, handler, event, {position.x, position.y, position.z}});
+                    if (handler == DynamicWindAPI::Handler::Animation) AddAnimationSamples(ref.get(), event);
+                }
+            };
+            if (conf->RotationHandlerEnabled)
+                collect(_trackedRotationRefs, DynamicWindAPI::Handler::Rotation, DynamicWindAPI::Event::Update);
+            if (conf->AnimationHandlerEnabled) collect(_trackedAnimationRefs, DynamicWindAPI::Handler::Animation, DynamicWindAPI::Event::Update);
+            if (conf->VisibilityHandlerEnabled) collect(_trackedVisibilityRefs, DynamicWindAPI::Handler::Visibility, DynamicWindAPI::Event::Update);
+            targetStart = _providerRequests.size();
+            if (_pendingProviderTargets) {
+                if (conf->RotationHandlerEnabled) collect(_trackedRotationRefs, DynamicWindAPI::Handler::Rotation, DynamicWindAPI::Event::Target);
+                if (conf->ModelSwapHandlerEnabled) collect(_trackedModelSwapRefs, DynamicWindAPI::Handler::ModelSwap, DynamicWindAPI::Event::Target);
+                if (conf->BaseObjSwapHandlerEnabled) collect(_trackedBaseObjSwapRefs, DynamicWindAPI::Handler::BaseObjectSwap, DynamicWindAPI::Event::Target);
+            }
+        }
+        _providerResponses.resize(_providerRequests.size());
+        const std::span requests{_providerRequests};
+        const std::span responses{_providerResponses};
+        if (targetStart)
+            WindProvider::Sample({{strength, angle}, deltaTime}, requests.first(targetStart), responses.first(targetStart));
+        if (targetStart < requests.size())
+            WindProvider::Sample({_providerTargetWind, deltaTime}, requests.subspan(targetStart), responses.subspan(targetStart));
+        bool targetsDeferred = false;
+        for (size_t i = 0; i < _providerRequests.size(); ++i)
+            targetsDeferred |= _providerRequests[i].event == DynamicWindAPI::Event::Target &&
+                               _providerResponses[i].result == DynamicWindAPI::Result::Defer;
         if (conf->RotationHandlerEnabled) {
             for (auto it = _trackedRotationRefs.begin(); it != _trackedRotationRefs.end();) {
                 auto ref = it->second.get().get();
@@ -39,7 +82,12 @@ public:
                     if (ref->IsDisabled() || ref->IsDeleted()) {
                         it = _trackedRotationRefs.erase(it);
                     } else {
-                        rotationHandler_.Apply(ref, strength, angle);
+                        const auto local = GetProviderWind(ref, DynamicWindAPI::Handler::Rotation, {strength, angle});
+                        rotationHandler_.Apply(ref, local.wind.strength, local.wind.angle);
+                        if (_pendingProviderTargets && !targetsDeferred) {
+                            const auto target = GetProviderWind(ref, DynamicWindAPI::Handler::Rotation, _providerTargetWind, DynamicWindAPI::Event::Target);
+                            rotationHandler_.Apply(ref, target.wind.strength, target.wind.angle, true);
+                        }
                         ++it;
                     }
                 }
@@ -54,7 +102,17 @@ public:
                     if (ref->IsDisabled() || ref->IsDeleted()) {
                         it = _trackedAnimationRefs.erase(it);
                     } else {
-                        animationHandler_.Apply(ref, strength, angle);
+                        const auto local = GetProviderWind(ref, DynamicWindAPI::Handler::Animation, {strength, angle});
+                        const bool watched = _animationDiagnostics.formID == ref->GetFormID();
+                        animationHandler_.Apply(ref, local.wind.strength, local.wind.angle,
+                                                watched ? &_animationDiagnostics.lastUpdate : nullptr);
+                        if (watched) {
+                            ++_animationDiagnostics.updates;
+                            if (local.result == DynamicWindAPI::Result::Ready) ++_animationDiagnostics.providerUpdates;
+                            _animationDiagnostics.lastWind = local;
+                            _animationDiagnostics.peakStrength = std::max(_animationDiagnostics.peakStrength, local.wind.strength);
+                            _animationDiagnostics.controllerWrites += _animationDiagnostics.lastUpdate.controllerWrites;
+                        }
                         ++it;
                     }
                 }
@@ -69,7 +127,8 @@ public:
                     if (ref->IsDisabled() || ref->IsDeleted()) {
                         it = _trackedVisibilityRefs.erase(it);
                     } else {
-                        visibilityHandler_.Apply(ref, strength, angle);
+                        const auto local = GetProviderWind(ref, DynamicWindAPI::Handler::Visibility, {strength, angle});
+                        visibilityHandler_.Apply(ref, local.wind.strength, local.wind.angle);
                         ++it;
                     }
                 }
@@ -84,11 +143,27 @@ public:
                     if (ref->IsDisabled() || ref->IsDeleted()) {
                         it = _trackedPushRefs.erase(it);
                     } else {
-                        pushHandler_.Apply(ref, strength, angle);
+                        pushHandler_.Apply(ref, strength, angle, deltaTime);
                         ++it;
                     }
                 }
             }
+        }
+        if (_pendingProviderTargets && !targetsDeferred) {
+            const auto applyTargets = [&](auto& refs, auto& handler, DynamicWindAPI::Handler kind) {
+                for (auto it = refs.begin(); it != refs.end();) {
+                    const auto ref = it->second.get();
+                    if (!ref || ref->IsDisabled() || ref->IsDeleted()) it = refs.erase(it);
+                    else {
+                        const auto local = GetProviderWind(ref.get(), kind, _providerTargetWind, DynamicWindAPI::Event::Target);
+                        handler.Apply(ref.get(), local.wind.strength, local.wind.angle);
+                        ++it;
+                    }
+                }
+            };
+            if (conf->ModelSwapHandlerEnabled) applyTargets(_trackedModelSwapRefs, modelSwapHandler_, DynamicWindAPI::Handler::ModelSwap);
+            if (conf->BaseObjSwapHandlerEnabled) applyTargets(_trackedBaseObjSwapRefs, baseObjSwapHandler_, DynamicWindAPI::Handler::BaseObjectSwap);
+            _pendingProviderTargets = false;
         }
     }
 
@@ -97,9 +172,17 @@ public:
 
         std::unique_lock lock(mutex_);
 
-        if (conf->TreeHandlerEnabled) {
+        // A provider controlling trees must not receive competing tree parameter writes.
+        if (conf->TreeHandlerEnabled && !WindProvider::Controls(DynamicWindAPI::Trees)) {
             treeHandler_.Update(strength, angle);
         }
+        if (WindProvider::IsEnabled()) {
+            WindProvider::TargetChanged();
+            _providerTargetWind = {strength, angle};
+            _pendingProviderTargets = true;
+            return;
+        }
+        _pendingProviderTargets = false;
         if (conf->RotationHandlerEnabled) {
             for (auto it = _trackedRotationRefs.begin(); it != _trackedRotationRefs.end();) {
                 auto ref = it->second.get().get();
@@ -149,7 +232,19 @@ public:
         }
     }
 
-    void DisableMod() { treeHandler_.Update(0, 0); }
+    /// Releases transient handler state without changing global tree settings.
+    void Suspend() {
+        std::unique_lock lock(mutex_);
+        WindProvider::Reset();
+        _pendingProviderTargets = false;
+    }
+
+    void DisableMod() {
+        Suspend();
+        std::unique_lock lock(mutex_);
+        // Resetting the mod must not write tree values owned by an external provider.
+        if (!WindProvider::Controls(DynamicWindAPI::Trees)) treeHandler_.Update(0, 0);
+    }
 
     void RefLoad(RE::TESObjectREFR* ref, float angle = 0.0f, float strength = 0.0f) {
         if (!ref) return;
@@ -165,27 +260,77 @@ public:
         auto* conf = Config::GetSingleton();
 
         std::unique_lock lock(mutex_);
-        if (conf->AnimationHandlerEnabled && (animationHandler_.HasConfig(baseFormID) || animationHandler_.HasConfig(formID))) {
+        if (conf->AnimationHandlerEnabled && animationHandler_.HasConfig(ref)) {
             _trackedAnimationRefs.try_emplace(formID, ref->GetHandle());
-        } else if (conf->RotationHandlerEnabled && (rotationHandler_.HasConfig(baseFormID) || rotationHandler_.HasConfig(formID))) {
+        }
+        if (conf->RotationHandlerEnabled && (rotationHandler_.HasConfig(baseFormID) || rotationHandler_.HasConfig(formID))) {
             if (_trackedRotationRefs.try_emplace(formID, ref->GetHandle()).second) {
-                rotationHandler_.Apply(ref, strength, angle, true);
+                const auto local = GetInitialProviderWind(ref, DynamicWindAPI::Handler::Rotation, {strength, angle});
+                rotationHandler_.Apply(ref, local.wind.strength, local.wind.angle, true);
             }
-        } else if (conf->VisibilityHandlerEnabled && (visibilityHandler_.HasConfig(baseFormID) || visibilityHandler_.HasConfig(formID))) {
+        }
+        if (conf->VisibilityHandlerEnabled && (visibilityHandler_.HasConfig(baseFormID) || visibilityHandler_.HasConfig(formID))) {
             _trackedVisibilityRefs.try_emplace(formID, ref->GetHandle());
-        } else if (conf->PushHandlerEnabled && (pushHandler_.HasConfig(baseFormID) || pushHandler_.HasConfig(formID))) {
+        }
+        if (conf->PushHandlerEnabled && (pushHandler_.HasConfig(baseFormID) || pushHandler_.HasConfig(formID))) {
             _trackedPushRefs.try_emplace(formID, ref->GetHandle());
-        } else if (conf->ModelSwapHandlerEnabled && (modelSwapHandler_.HasConfig(baseFormID) || modelSwapHandler_.HasConfig(formID))) {
+        }
+        if (conf->ModelSwapHandlerEnabled && !_trackedBaseObjSwapRefs.contains(formID) &&
+            (modelSwapHandler_.HasConfig(baseFormID) || modelSwapHandler_.HasConfig(formID))) {
             if (_trackedModelSwapRefs.try_emplace(formID, ref->GetHandle()).second) {
-                modelSwapHandler_.Apply(ref, strength, angle);
+                const auto local = GetInitialProviderWind(ref, DynamicWindAPI::Handler::ModelSwap, {strength, angle});
+                modelSwapHandler_.Apply(ref, local.wind.strength, local.wind.angle);
             }
-        } else if (conf->BaseObjSwapHandlerEnabled && (baseObjSwapHandler_.HasConfig(baseFormID) || baseObjSwapHandler_.HasConfig(formID))) {
+        } else if (conf->BaseObjSwapHandlerEnabled && !_trackedModelSwapRefs.contains(formID) &&
+                   (baseObjSwapHandler_.HasConfig(baseFormID) || baseObjSwapHandler_.HasConfig(formID))) {
             if (_trackedBaseObjSwapRefs.try_emplace(formID, ref->GetHandle()).second) {
-                baseObjSwapHandler_.Apply(ref, strength, angle);
+                const auto local = GetInitialProviderWind(ref, DynamicWindAPI::Handler::BaseObjectSwap, {strength, angle});
+                baseObjSwapHandler_.Apply(ref, local.wind.strength, local.wind.angle);
             }
         }
 
         // --- other object types TBD ---
+    }
+
+    /// Watches one reference and reports its matching, tracking, sampling and actual animation writes.
+    std::string GetAnimationDiagnostics(RE::TESObjectREFR* ref) {
+        std::unique_lock lock(mutex_);
+        if (!ref || !ref->GetBaseObject()) return "No reference with a base object selected.";
+        const auto formID = ref->GetFormID();
+        const auto baseID = ref->GetBaseObject()->GetFormID();
+        if (_animationDiagnostics.formID != formID) _animationDiagnostics = {formID};
+        const auto* config = animationHandler_.GetMatchingConfig(ref);
+        const auto* settings = Config::GetSingleton();
+        std::string text = std::format("Reference: {:08X} | Base: {:08X}\nNIF: {}\nLoaded animation rules: {} | Indexed NIF paths: {}\n",
+                                      formID, baseID, Utils::GetModelPath(ref->GetBaseObject()),
+                                      animationHandler_.GetConfigs().size(), animationHandler_.GetModelConfigCount());
+        if (config) {
+            const char* match = config->formID == formID ? "reference ID" : config->formID == baseID ? "base ID" : "NIF match";
+            text += std::format("Matched rule: {:08X} via {}\nRule file: {}\nConfigured speed: {:.3f} to {:.3f}\n",
+                                config->formID, match, config->filePath, config->speedMin, config->speedMax);
+        } else {
+            text += "Matched rule: NONE\n";
+        }
+        text += std::format("DWF enabled: {} | Animation handler enabled: {}\n"
+                            "3D loaded: {} | Reference disabled: {} | Deleted: {} | Wind cell: {}\n"
+                            "Tracked by DWF animation handler: {}\n",
+                            settings->ModActive ? "Yes" : "No", settings->AnimationHandlerEnabled ? "Yes" : "No",
+                            ref->Get3D() ? "Yes" : "No", ref->IsDisabled() ? "Yes" : "No", ref->IsDeleted() ? "Yes" : "No",
+                            Utils::IsInWindCell(ref) ? "Yes" : "No", _trackedAnimationRefs.contains(formID) ? "YES" : "NO");
+        const auto& diagnostics = _animationDiagnostics;
+        text += std::format("Updates since inspection began: {}\nExternal wind updates: {} | Native/fallback updates: {}\n",
+                            diagnostics.updates, diagnostics.providerUpdates, diagnostics.updates - diagnostics.providerUpdates);
+        if (diagnostics.updates) {
+            text += std::format("Last input: {} | Wind strength: {:.4f} | Peak strength: {:.4f}\n"
+                                "Last computed animation speed: {}\n"
+                                "Controller writes last update: {} | Total writes: {}\n",
+                                diagnostics.lastWind.result == DynamicWindAPI::Result::Ready ? "external provider" : "native/fallback",
+                                diagnostics.lastWind.wind.strength, diagnostics.peakStrength,
+                                diagnostics.lastUpdate.evaluated ? std::format("{:.4f}", diagnostics.lastUpdate.speed) : "not calculated",
+                                diagnostics.lastUpdate.controllerWrites, diagnostics.controllerWrites);
+        }
+        text += "Counters continue while the menu is closed; selecting another reference resets them.";
+        return text;
     }
 
     std::map<RE::FormID, WindObjectConfigs> GetConfigs() {
@@ -323,6 +468,69 @@ public:
     void RemoveBaseObjSwapConfig(const RE::FormID formID) { baseObjSwapHandler_.RemoveConfig(formID); }
 
 private:
+    struct AnimationDiagnostics {
+        RE::FormID formID{};
+        uint64_t updates{};
+        uint64_t providerUpdates{};
+        uint64_t controllerWrites{};
+        float peakStrength{};
+        DynamicWindAPI::Response lastWind;
+        AnimationUpdateDiagnostics lastUpdate;
+    } _animationDiagnostics;
+
+    void AddAnimationSamples(RE::TESObjectREFR* ref, DynamicWindAPI::Event event) {
+        const auto* root = ref->Get3D();
+        if (!root || !ref->GetBaseObject()) return;
+        const auto min = ref->GetBoundMin();
+        const auto max = ref->GetBoundMax();
+        const auto finite = [](const RE::NiPoint3& point) {
+            return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+        };
+        if (!finite(min) || !finite(max) || min.x > max.x || min.y > max.y || min.z > max.z || min == max) return;
+        const auto center = min + (max - min) * 0.5f;
+        for (const float x : {min.x, center.x, max.x})
+            for (const float y : {min.y, center.y, max.y})
+                for (const float z : {min.z, center.z, max.z}) {
+                    const auto position = root->world * RE::NiPoint3{x, y, z};
+                    if (finite(position))
+                        _providerRequests.push_back({ref->GetFormID(), DynamicWindAPI::Handler::Animation, event,
+                                                     {position.x, position.y, position.z}});
+                }
+    }
+
+    // Missing or deferred continuous samples preserve the original handler inputs.
+    DynamicWindAPI::Response GetProviderWind(const RE::TESObjectREFR* ref, DynamicWindAPI::Handler handler, DynamicWindAPI::Wind fallback,
+                                            DynamicWindAPI::Event event = DynamicWindAPI::Event::Update) const {
+        const auto index = _providerIndices.find((uint64_t(handler) << 40) | (uint64_t(event) << 32) | ref->GetFormID());
+        if (index != _providerIndices.end()) {
+            auto response = _providerResponses[index->second];
+            if (handler == DynamicWindAPI::Handler::Animation) {
+                for (size_t i = index->second + 1; i < _providerResponses.size(); ++i) {
+                    const auto& request = _providerRequests[i];
+                    if (request.handler != handler || request.formID != ref->GetFormID()) break;
+                    const auto& sample = _providerResponses[i];
+                    if (sample.result == DynamicWindAPI::Result::Ready &&
+                        (response.result != DynamicWindAPI::Result::Ready || sample.wind.strength > response.wind.strength))
+                        response = sample;
+                }
+            }
+            if (response.result == DynamicWindAPI::Result::Ready) return response;
+        }
+        return {fallback, DynamicWindAPI::Result::Fallback};
+    }
+
+    // Initial variants may use provider inputs before their first frame update.
+    DynamicWindAPI::Response GetInitialProviderWind(const RE::TESObjectREFR* ref, DynamicWindAPI::Handler handler,
+                                                   DynamicWindAPI::Wind fallback) {
+        const auto position = ref->GetPosition();
+        const DynamicWindAPI::Request request{ref->GetFormID(), handler, DynamicWindAPI::Event::Initial,
+                                              {position.x, position.y, position.z}};
+        DynamicWindAPI::Response response;
+        WindProvider::Sample({fallback, 0.0f}, {&request, 1}, {&response, 1});
+        return response.result == DynamicWindAPI::Result::Ready ? response :
+            DynamicWindAPI::Response{fallback, DynamicWindAPI::Result::Fallback};
+    }
+
     AnimationHandler animationHandler_;
     BaseObjSwapHandler baseObjSwapHandler_;
     ModelSwapHandler modelSwapHandler_;
@@ -331,6 +539,11 @@ private:
     TreeHandler treeHandler_;
     VisibilityHandler visibilityHandler_;
 
+    bool _pendingProviderTargets = false;
+    DynamicWindAPI::Wind _providerTargetWind;
+    std::vector<DynamicWindAPI::Request> _providerRequests;
+    std::vector<DynamicWindAPI::Response> _providerResponses;
+    std::unordered_map<uint64_t, std::size_t> _providerIndices;
     std::shared_mutex mutex_;
     std::unordered_map<RE::FormID, RE::ObjectRefHandle> _trackedAnimationRefs;
     std::unordered_map<RE::FormID, RE::ObjectRefHandle> _trackedBaseObjSwapRefs;

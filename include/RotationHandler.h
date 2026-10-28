@@ -67,7 +67,9 @@ public:
             }
 
             auto currAngle = ref->GetAngle();
-            currAngle.z = chosen * static_cast<float>(M_PI) / 180.0f;
+            const float targetAngle = chosen * static_cast<float>(M_PI) / 180.0f;
+            if (currAngle.z == targetAngle) return;
+            currAngle.z = targetAngle;
             ref->SetAngle(currAngle);
             ref->Update3DPosition(true);
             return;
@@ -75,7 +77,9 @@ public:
 
         if (!cfg.allowedAngles && !NewTargets) {
             auto currAngle = ref->GetAngle();
-            currAngle.z = cfg.headingRotation - windAngle;
+            const float targetAngle = cfg.headingRotation - windAngle;
+            if (currAngle.z == targetAngle) return;
+            currAngle.z = targetAngle;
             ref->SetAngle(currAngle);
             ref->Update3DPosition(true);
         }

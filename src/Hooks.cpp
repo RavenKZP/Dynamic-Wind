@@ -24,16 +24,18 @@ namespace Hooks {
         auto res = Load3D_(a_this, a_backgroundLoading);
         auto* conf = Config::GetSingleton();
         if (conf->ModActive) {
-            auto start = std::chrono::high_resolution_clock::now();
-
-            auto [angle, strength] = Wind::Manager::GetSingleton()->GetTargets();
-            WindFramework::GetSingleton()->RefLoad(a_this, angle, strength);
-
-            if (conf->EnableTimeLogging) {
-                auto end = std::chrono::high_resolution_clock::now();
-                std::chrono::duration<double, std::milli> elapsed = end - start;
-                logger::debug("WindFramework RefLoad {} ms", elapsed.count());
-            }
+            SKSE::GetTaskInterface()->AddTask([handle = a_this->GetHandle()]() {
+                const auto ref = handle.get();
+                if (!ref || !Config::GetSingleton()->ModActive) return;
+                auto start = std::chrono::high_resolution_clock::now();
+                auto [angle, strength] = Wind::Manager::GetSingleton()->GetTargets();
+                WindFramework::GetSingleton()->RefLoad(ref.get(), angle, strength);
+                if (Config::GetSingleton()->EnableTimeLogging) {
+                    auto end = std::chrono::high_resolution_clock::now();
+                    std::chrono::duration<double, std::milli> elapsed = end - start;
+                    logger::debug("WindFramework RefLoad {} ms", elapsed.count());
+                }
+            });
         }
         return res;
     }

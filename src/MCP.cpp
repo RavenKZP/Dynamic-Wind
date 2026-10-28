@@ -35,6 +35,7 @@ namespace MCP {
         ImGuiMCP::Checkbox("Model Swap Handler", &set->ModelSwapHandlerEnabled);
         ImGuiMCP::Checkbox("Push Handler", &set->PushHandlerEnabled);
         ImGuiMCP::Checkbox("Rotation Handler", &set->RotationHandlerEnabled);
+        ImGuiMCP::BeginDisabled(WindProvider::Controls(DynamicWindAPI::Trees));
         if (ImGuiMCP::Checkbox("Tree Handler", &set->TreeHandlerEnabled)) {
             if (!set->TreeHandlerEnabled) {
                 Wind::Manager::GetSingleton()->DisableMod();
@@ -42,6 +43,7 @@ namespace MCP {
                 Wind::Manager::GetSingleton()->EnableMod();
             }
         }
+        ImGuiMCP::EndDisabled();
         ImGuiMCP::Checkbox("Visibility Handler", &set->VisibilityHandlerEnabled);
         ImGuiMCP::SliderFloat("Min Wind Strength", &set->minWindStrength, 0.0f, 1.0f);
         ImGuiMCP::SliderFloat("Max Wind Strength", &set->maxWindStrength, 0.0f, 1.0f);
@@ -117,6 +119,7 @@ namespace MCP {
                         return RE::BSContainer::ForEachResult::kContinue;
                     });
                 }
+                ImGuiMCP::BeginDisabled(WindProvider::Controls(DynamicWindAPI::Trees));
                 auto* treeMgr = RE::BSTreeManager::GetSingleton();
                 if (treeMgr) {
                     ImGuiMCP::Text("TreeWind x: %.2f", treeMgr->windDirection.x);
@@ -128,6 +131,7 @@ namespace MCP {
                     }
                     ImGuiMCP::SliderFloat("TreeManager: Wind Magnitude", &treeMgr->windMagnitude, 0.0f, 10.0f);
                 }
+                ImGuiMCP::EndDisabled();
             }
         }
 
@@ -135,6 +139,7 @@ namespace MCP {
             if (auto ref = refPtr.get()) {
                 if (auto* base = ref->GetBaseObject()) {
                     auto windFram = WindFramework::GetSingleton();
+                    ImGuiMCP::BeginDisabled(WindProvider::Controls(DynamicWindAPI::Trees));
                     // Try casting to tree (TESObjectTREE)
                     if (auto* tree = base->As<RE::TESObjectTREE>()) {
                         // Access tree data (CNAM)
@@ -222,6 +227,14 @@ namespace MCP {
                         }
                     }
 
+                    ImGuiMCP::EndDisabled();
+                    if (ImGuiMCP::CollapsingHeader("Animation Diagnostics")) {
+                        const auto diagnostics = windFram->GetAnimationDiagnostics(ref);
+                        ImGuiMCP::Text("%s", diagnostics.c_str());
+                        if (ImGuiMCP::Button("Log Animation Diagnostics")) {
+                            logger::info("Animation diagnostics:\n{}", diagnostics);
+                        }
+                    }
                     if (ImGuiMCP::CollapsingHeader("Animation Settings")) {
                         static float minAnimSpeed = 0.0f;
                         static float maxAnimSpeed = 1.0f;
@@ -765,6 +778,7 @@ namespace MCP {
                 }
             }
 
+            ImGuiMCP::BeginDisabled(WindProvider::Controls(DynamicWindAPI::Trees));
             // TreeConfig
             if (config.treeConfig && showTreeConf) {
                 if (!treeEditBuf.contains(formID)) {
@@ -813,6 +827,7 @@ namespace MCP {
                 }
             }
 
+            ImGuiMCP::EndDisabled();
             // ModelSwapConfig
             if (config.modelSwapConfig && showModelConf) {
                 if (!modelEditBuf.contains(formID)) {
