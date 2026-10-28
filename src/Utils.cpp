@@ -1,6 +1,11 @@
 #include "Utils.h"
 
 #include "Hooks.h"
+#include "WindProvider.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
 
 namespace Utils {
     std::string FormIDToString(RE::FormID formID) {
@@ -72,7 +77,7 @@ namespace Utils {
         return form->GetFormID();
     }
 
-    void ApplySpeedToNode(RE::NiAVObject* node, float speed) {
+    void ApplySpeedToNode(RE::NiAVObject* node, float speed, uint32_t* controllerWrites) {
         if (!node) return;
 
         // Check controller on this node
@@ -80,32 +85,64 @@ namespace Utils {
             for (auto* seq : contMgr->activeSequences) {
                 if (seq) {
                     seq->frequency = speed;
+                    if (controllerWrites) ++*controllerWrites;
                 }
             }
         } else if (auto* contTime = node->GetController<RE::NiTimeController>()) {
             contTime->frequency = speed;
+            if (controllerWrites) ++*controllerWrites;
         }
 
         // If it's a NiNode recurse into children
         if (auto* niNode = node->AsNode()) {
             for (auto& child : niNode->GetChildren()) {
-                ApplySpeedToNode(child.get(), speed);
+                ApplySpeedToNode(child.get(), speed, controllerWrites);
             }
         }
     }
 
-    void ApplyImpulseToNode(RE::NiAVObject* node, RE::hkVector4 velocity) {
+    void ApplyImpulseToNode(RE::NiAVObject* node, RE::hkVector4 velocity, const DynamicWindAPI::Frame& frame,
+                            RE::FormID formID, float impulseScale) {
         if (!node) return;
         if (auto* collisionObject = node->GetCollisionObject()) {
             if (auto* rigidBody = collisionObject->body->AsBhkRigidBody()) {
-                rigidBody->SetLinearImpulse(velocity);
+                auto localVelocity = velocity;
+                if (WindProvider::IsEnabled()) {
+                    RE::hkVector4 centerOfMass;
+                    if (auto* world = rigidBody->GetWorld2(); world && world->userData) {
+                        RE::BSReadLockGuard lock(world->userData->worldLock);
+                        rigidBody->GetCenterOfMassWorld(centerOfMass);
+                    } else {
+                        rigidBody->GetCenterOfMassWorld(centerOfMass);
+                    }
+                    const auto& center = centerOfMass.quad.m128_f32;
+                    const float worldScale = RE::bhkWorld::GetWorldScaleInverse();
+                    const DynamicWindAPI::Vector position{center[0] * worldScale, center[1] * worldScale, center[2] * worldScale};
+                    if (std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)) {
+                        const std::array requests{DynamicWindAPI::Request{
+                            formID, DynamicWindAPI::Handler::Push, DynamicWindAPI::Event::Update, position}};
+                        std::array<DynamicWindAPI::Response, 1> responses;
+                        WindProvider::Sample(frame, requests, responses);
+                        if (responses[0].result == DynamicWindAPI::Result::Ready) {
+                            const auto& wind = responses[0].velocity;
+                            float scale = impulseScale * responses[0].pushSensitivity;
+                            const float magnitude = std::hypot(wind.x, wind.y, wind.z);
+                            if (responses[0].pushResponse == DynamicWindAPI::PushResponse::Cubic && magnitude > 0.0f) {
+                                scale *= std::min(magnitude * magnitude, 1.0f / magnitude) /
+                                    (DynamicWindAPI::PushReferenceStrength * DynamicWindAPI::PushReferenceStrength);
+                            }
+                            localVelocity = RE::hkVector4{wind.x * scale, wind.y * scale, wind.z * scale, 0.0f};
+                        }
+                    }
+                }
+                rigidBody->SetLinearImpulse(localVelocity);
             }
         }
 
         // If it's a NiNode recurse into children
         if (auto* niNode = node->AsNode()) {
             for (auto& child : niNode->GetChildren()) {
-                ApplyImpulseToNode(child.get(), velocity);
+                ApplyImpulseToNode(child.get(), velocity, frame, formID, impulseScale);
             }
         }
     }
@@ -195,6 +232,7 @@ namespace Utils {
         if (auto door = base->As<RE::TESObjectDOOR>()) {
             return door->model.c_str();
         }
+        return "";
     }
 
     bool IsInWindCell(RE::TESObjectREFR* ref) {

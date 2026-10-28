@@ -3,6 +3,7 @@
 #include "REX/REX.h"
 
 #include "WindFramework.h"
+#include "WindProvider.h"
 #include "Settings.h"
 
 #define M_PI 3.14159265358979323846f
@@ -24,32 +25,54 @@ namespace Wind {
                 return;
             }
 
+            _previousWorldspace = player->GetWorldspace();
+            _previousCell = player->GetParentCell();
+
             auto* sky = RE::Sky::GetSingleton();
             if (!sky || !sky->currentWeather) {
                 return;
             }
 
-            if (_previousWeather != sky->currentWeather) {
+            if (WindProvider::Controls(DynamicWindAPI::GlobalWind)) {
+                const bool targetsChanged = !_providerOwnedWind || _previousWeather != sky->currentWeather;
+                _providerOwnedWind = true;
+                _previousWeather = sky->currentWeather;
+                _strength = _targetStrength = sky->windSpeed;
+                _angle = _targetAngle = sky->windAngle;
+                if (targetsChanged) {
+                    WindFramework::GetSingleton()->NewTargets(_targetStrength, _targetAngle);
+                }
+                if (!_TestMode || _UpdateWindFramework)
+                    WindFramework::GetSingleton()->Update(_strength, _angle, deltaTime);
+                return;
+            }
+
+            if (_providerOwnedWind || _previousWeather != sky->currentWeather) {
+                _providerOwnedWind = false;
                 _previousWeather = sky->currentWeather;
                 GenerateNewTargets(sky);
             }
 
             // Smooth interpolation toward target
-            _angle = LerpAngle(_angle, _targetAngle, deltaTime * 0.1f);
-            _strength = Lerp(_strength, _targetStrength, deltaTime * 0.1f);
+            if (WindProvider::Controls(DynamicWindAPI::Transitions)) {
+                _angle = _targetAngle;
+                _strength = _targetStrength;
+            } else {
+                _angle = LerpAngle(_angle, _targetAngle, deltaTime * 0.1f);
+                _strength = Lerp(_strength, _targetStrength, deltaTime * 0.1f);
+            }
 
             static float time = 0.0f;
             time += deltaTime;
 
-            // Add smooth procedural gusts
-            // Range: -3 / 10 <= f <= 3 / 10
-            float gust = std::sin(time * 0.7f) * 0.2f + std::sin(time * 2.3f) * 0.1f;
-
-            float finalStrength = std::clamp(_strength + (gust * _strength), 0.0f, 1.0f);
-
-            // Angle turbulence
-            float angleNoise = std::sin(time * 0.5f) * 0.1f + std::cos(time * 0.4f) * 0.1f;
-            float finalAngle = _angle + angleNoise;
+            float finalStrength = _strength;
+            float finalAngle = _angle;
+            if (!WindProvider::Controls(DynamicWindAPI::Gusts)) {
+                float gust = std::sin(time * 0.7f) * 0.2f + std::sin(time * 2.3f) * 0.1f;
+                finalStrength = std::clamp(_strength + (gust * _strength), 0.0f, 1.0f);
+                float angleNoise = std::sin(time * 0.5f) * 0.1f + std::cos(time * 0.4f) * 0.1f;
+                finalAngle = _angle + angleNoise;
+            }
 
             while (finalAngle > M_PI) finalAngle -= M_PI * 2.0f;
             while (finalAngle < -M_PI) finalAngle += M_PI * 2.0f;
@@ -60,7 +83,7 @@ namespace Wind {
                 sky->windAngle = _targetAngle;
                 // if no precipitation, set it to match the wind direction and strength
                 if (!sky->IsRaining() && !sky->IsSnowing()) {
-                    auto& precipDir = sky->precip->GetDirection();
+                    auto& precipDir = GetPrecipitationDirection();
                     precipDir.x = std::cos(_targetAngle);
                     precipDir.y = std::sin(_targetAngle);
                     precipDir.z = _targetStrength;
@@ -73,7 +96,7 @@ namespace Wind {
                 sky->windAngle = finalAngle;
                 // if no precipitation, set it to match the wind direction and strength
                 if (!sky->IsRaining() && !sky->IsSnowing()) {
-                    auto& precipDir = sky->precip->GetDirection();
+                    auto& precipDir = GetPrecipitationDirection();
                     precipDir.x = std::cos(finalAngle);
                     precipDir.y = std::sin(finalAngle);
                     precipDir.z = finalStrength;
@@ -83,6 +106,8 @@ namespace Wind {
         }
 
         void SetTargets(float angle, float speed) {
+            if (WindProvider::Controls(DynamicWindAPI::GlobalWind)) return;
+            _providerOwnedWind = false;
             _targetAngle = angle;
             _targetStrength = speed;
 
@@ -96,6 +121,11 @@ namespace Wind {
         std::pair<float, float> GetTargets() const { return {_targetAngle, _targetStrength}; }
 
         void DisableMod() { 
+            const bool providerOwnedWind = WindProvider::Controls(DynamicWindAPI::GlobalWind);
+            if (providerOwnedWind) {
+                WindFramework::GetSingleton()->DisableMod();
+                return;
+            }
             auto* sky = RE::Sky::GetSingleton();
             float vanillaStrength = float(sky->currentWeather->data.windSpeed) / 255.0f;
             float vanillaAngle = sky->currentWeather->data.windDirection * (M_PI / 128.0f);
@@ -105,11 +135,21 @@ namespace Wind {
         }
 
         void EnableMod() {
+            _providerOwnedWind = false;
+            if (WindProvider::Controls(DynamicWindAPI::GlobalWind)) {
+                return;
+            }
             auto* sky = RE::Sky::GetSingleton();
             GenerateNewTargets(sky);
         }
 
     private:
+        // CommonLib returns a copy, so writes must target the engine's precipitation vector.
+        static RE::NiPoint3& GetPrecipitationDirection() {
+            static REL::Relocation<RE::NiPoint3*> direction{RELOCATION_ID(515509, 401648)};
+            return *direction;
+        }
+
         void GenerateNewTargets(const RE::Sky* sky) {
             float vanillaStrength = float(sky->currentWeather->data.windSpeed) / 255.0f;
 
@@ -128,6 +168,9 @@ namespace Wind {
         }
 
         void InteriorCellUpdate() {
+            const bool providerOwnedWind = WindProvider::Controls(DynamicWindAPI::GlobalWind);
+            WindFramework::GetSingleton()->Suspend();
+            if (providerOwnedWind) return;
             auto* sky = RE::Sky::GetSingleton();
             if (sky) {
                 sky->windSpeed = 0.0f;
@@ -161,5 +204,6 @@ namespace Wind {
 
         bool _TestMode{false};
         bool _UpdateWindFramework{true};
+        bool _providerOwnedWind{false};
     };
 }

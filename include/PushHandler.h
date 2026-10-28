@@ -1,6 +1,8 @@
 #pragma once
 
 #include "Utils.h"
+#include "DynamicWindAPI.h"
+#include <algorithm>
 #include <nlohmann/json.hpp>
 
 struct PushConfig {
@@ -41,7 +43,7 @@ public:
         }
     }
 
-    void Apply(RE::TESObjectREFR* ref, float windStrength, float windAngle) {
+    void Apply(RE::TESObjectREFR* ref, float windStrength, float windAngle, float deltaTime) {
         auto* node = ref->Get3D();
         if (!node) return;
 
@@ -52,17 +54,18 @@ public:
         }
 
         const auto& cfg = it->second;
-        float scale = float(std::min(1.0, std::pow(windStrength, 3.0)));
-
-        float xVelocity = scale * cfg.windSensitivity * std::cos(windAngle);
-        float yVelocity = scale * cfg.windSensitivity * std::sin(windAngle);
-
-        RE::hkVector4 velocity{xVelocity, yVelocity, 0.0f, 0.0f};
-
-        Utils::ApplyImpulseToNode(node, velocity);
+        float nativeScale = float(std::min(1.0, std::pow(windStrength, 3.0)));
+        RE::hkVector4 nativeVelocity{nativeScale * cfg.windSensitivity * std::cos(windAngle),
+                                    nativeScale * cfg.windSensitivity * std::sin(windAngle), 0.0f, 0.0f};
+        const float scale = cfg.windSensitivity * LinearForceScale * std::min(deltaTime, MaximumTimeStep);
+        Utils::ApplyImpulseToNode(node, nativeVelocity, {{windStrength, windAngle}, deltaTime}, ref->GetFormID(), scale);
     }
 
 private:
+    static constexpr float ReferenceUpdateRate = 60.0f;
+    static constexpr float LinearForceScale = ReferenceUpdateRate * DynamicWindAPI::PushReferenceStrength * DynamicWindAPI::PushReferenceStrength;
+    static constexpr float MaximumTimeStep = 0.1f;
+
     void SaveConfigToFile(const RE::FormID formID, const PushConfig& cfg) {
         std::filesystem::create_directories("Data\\SKSE\\Plugins\\DynamicWind\\Push");
         std::string path = std::format("Data\\SKSE\\Plugins\\DynamicWind\\Push\\{:08X}.json", formID);
